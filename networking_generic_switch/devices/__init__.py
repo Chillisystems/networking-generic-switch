@@ -38,6 +38,7 @@ NGS_INTERNAL_OPTS = [
     {'name': 'ngs_switchport_mode', 'default': 'access'},
     # If True, disable switch ports that are not in use.
     {'name': 'ngs_disable_inactive_ports', 'default': False},
+    {'name': 'ngs_trunk_mode', 'default': 'static'}
 ]
 
 
@@ -106,6 +107,10 @@ class GenericSwitchDevice(object):
             self.ngs_config['ngs_disable_inactive_ports'])
 
     @abc.abstractmethod
+    def setup_trunk(self, native_vlan, subports, port_id):
+        pass
+
+    @abc.abstractmethod
     def add_network(self, segmentation_id, network_id):
         pass
 
@@ -120,3 +125,6 @@ class GenericSwitchDevice(object):
     @abc.abstractmethod
     def delete_port(self, port_id, segmentation_id):
         pass
+
+    def get_trunk_mode(self):
+        return self.ngs_config['ngs_trunk_mode']
