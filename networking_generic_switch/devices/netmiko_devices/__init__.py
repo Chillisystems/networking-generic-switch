@@ -79,6 +79,10 @@ class NetmikoSwitch(devices.GenericSwitchDevice):
 
     SAVE_CONFIGURATION = None
 
+    RESET_TRUNK = None
+
+    UNSET_TRUNK = None
+
     ERROR_MSG_PATTERNS = ()
     """Sequence of error message patterns.
 
@@ -185,9 +189,20 @@ class NetmikoSwitch(devices.GenericSwitchDevice):
         except Exception as e:
             raise exc.GenericSwitchNetmikoConnectError(
                 config=device_utils.sanitise_config(self.config), error=e)
-
         LOG.debug(output)
         return output
+
+    def unset_trunk(self, port_id, segment_id):
+        raise NotImplementedError()
+
+    def setup_trunk(self, native_vlan, subports):
+        raise NotImplementedError()
+
+    def add_trunk_vlans(self, subports, port_id, trunk_details, native_vlan):
+        raise NotImplementedError()
+
+    def remove_trunk_vlans(self, subports, port_id, trunk_details, native_vlan):
+        raise NotImplementedError()
 
     @check_output('add network')
     def add_network(self, segmentation_id, network_id):

@@ -13,14 +13,19 @@
 #    under the License.
 
 from neutron.db import provisioning_blocks
+
 from neutron_lib.api.definitions import portbindings
+from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
+from neutron_lib.callbacks import events
 from neutron_lib.plugins.ml2 import api
+from neutron.services.trunk import constants
 from oslo_log import log as logging
 
 from networking_generic_switch import config as gsw_conf
 from networking_generic_switch import devices
 from networking_generic_switch.devices import utils as device_utils
+from networking_generic_switch import exceptions
 
 LOG = logging.getLogger(__name__)
 
@@ -46,6 +51,146 @@ class GenericSwitchDriver(api.MechanismDriver):
         if not self.switches:
             LOG.error('No devices have been loaded')
         self.warned_del_network = False
+
+        registry.subscribe(
+            self.add_subports_to_trunk,
+            constants.SUBPORTS,
+            events.PRECOMMIT_CREATE
+        )
+
+        registry.subscribe(
+            self.remove_subports_from_trunk,
+            constants.SUBPORTS,
+            events.PRECOMMIT_DELETE
+        )
+
+    def _check_physnets(self, parent_physnet, physnets):
+        for physnet in physnets:
+            if physnet != parent_physnet:
+                raise Exception("One or more subports have physical networks that do not match that of the parent port")
+        return True
+
+    """Processes non-link information relevant to subnet ops.
+    """
+    def _process_payload(self, payload):
+        # Segmentation ids of the subports already bound in the trunk
+        trunk_details = payload.parent_port.get('trunk_details')
+        current_seg_ids = [
+            sub_port['segmentation_id'] for sub_port in
+            trunk_details["sub_ports"]
+        ]
+
+        # The segmentation id used as the native vlan; the one corresponding to the
+        # provider network
+        native_vlan = payload.network['provider:segmentation_id']
+
+        return current_seg_ids, native_vlan
+
+    def remove_subports_from_trunk(self, resource, event, plugin, payload):
+        if self._is_port_bound(payload.parent_port):
+            # seg_ids to remove from switches
+            to_remove_seg_ids = []
+            for subport in payload.subports:
+                # No physnet or seg_id checks on removal, since those are not
+                # terribly relevant on removal - if, for some reason, physnet
+                # or seg id didn't match, removing the port fixes a
+                # misconfiguration, which is desirable
+                seg_id = subport.get('segmentation_id')
+                to_remove_seg_ids.append(seg_id)
+
+            # Retrieve switch devices and the port which should be configured
+            # on them
+            switches, port_id = self._process_link_information(payload)
+
+            current_seg_ids, native_vlan = self._process_payload(payload)
+
+            for switch in switches:
+                if switch.get_trunk_mode() == 'dynamic':
+                    switch.remove_trunk_vlans(to_remove_seg_ids, port_id, current_seg_ids, native_vlan)
+
+    def add_subports_to_trunk(self, resource, event, plugin, payload):
+        if self._is_port_bound(payload.parent_port):
+            # Goes through the subports being added to the trunk object
+            # and collects them in an array if valid
+            parent_physnet = payload.network['provider:physical_network']
+            to_add_seg_ids = []
+            for subport in payload.subports:
+                subport_id = subport['port_id']
+
+                # Every subport must belong to the same physical network as the
+                # Trunk parent port
+                physnet = payload.physnets[subport_id]
+                if physnet != parent_physnet:
+                    raise exceptions.BadPhysnetsAddError(subport_id=subport_id,
+                        physnet=physnet, parent_physnet=parent_physnet)
+
+                # Checks if the segmentation id assigned to the port by the
+                # user matches it's networks segmentation id (inherit); if
+                # an arbitrary value was accepted blindly, any network could
+                # be broken into!
+                network_seg_id = payload.seg_ids[subport_id]
+                seg_id = subport.get('segmentation_id')
+                if seg_id != network_seg_id:
+                    raise exceptions.BadSegIdAddError(subport_id=subport_id,
+                        actual=seg_id, parent=network_seg_id)
+
+                # If all checks pass, the seg id is valid and may be added
+                to_add_seg_ids.append(seg_id)
+
+            # Retrieve switch devices and the port which should be configured
+            # on them
+            switches, port_id = self._process_link_information(payload)
+
+            current_seg_ids, native_vlan = self._process_payload(payload)
+
+            # Execute switch configuration
+            for switch in switches:
+                if switch.get_trunk_mode() == 'dynamic':
+                    switch.add_trunk_vlans(
+                        to_add_seg_ids, port_id, current_seg_ids, native_vlan
+                    )
+
+    # Processes a TrunkPayload object to find the correct switch devices and
+    # switch port id
+    def _process_link_information(self, payload):
+        parent_port = payload.parent_port
+        binding_profile = parent_port.get('binding:profile')
+        local_link_information = binding_profile.get('local_link_information')
+
+        # transcribes LAG information if parent port is bonded
+        local_group_information = binding_profile.get('local_group_information')
+        if local_group_information:
+            self._lag_alter_local_link(local_group_information, local_link_information)
+
+        switch_devices = []
+        # The switch port id of the port which should be set:
+        # e.g.: xe-0/0/13, ae-0/0/11 etc...
+        port_id = None
+        for local_link in local_link_information:
+
+            # The port id has to be identical for all link definitions in a
+            # bond, non-bonded ports shouldn't have more than one link
+            if port_id is None:
+                port_id = local_link.get('port_id')
+            elif port_id != local_link.get('port_id'):
+                LOG.warning(
+                    "Multiple links have been detected with mismatching "
+                    "router port ids; only bonds are expected to have more "
+                    "than one link WITH matching port ids. Setup will "
+                    "continue, but may behave strangely!")
+
+            # retrieve the correct switch for the given link
+            switch_info = local_link.get('switch_info')
+            switch_id = local_link.get('switch_id')
+            switch = device_utils.get_switch_device(
+                self.switches,
+                switch_info=switch_info,
+                ngs_mac_address=switch_id
+            )
+            switch_devices.append(switch)
+
+        return switch_devices, port_id
+
 
     def create_network_precommit(self, context):
         """Allocate resources for a new network.
@@ -346,18 +491,24 @@ class GenericSwitchDriver(api.MechanismDriver):
             binding_profile = port['binding:profile']
             local_link_information = binding_profile.get(
                 'local_link_information')
+            local_group_information = binding_profile.get(
+                'local_group_information')
             if not local_link_information:
                 return
-            switch_info = local_link_information[0].get('switch_info')
-            switch_id = local_link_information[0].get('switch_id')
-            switch = device_utils.get_switch_device(
-                self.switches, switch_info=switch_info,
-                ngs_mac_address=switch_id)
-            if not switch:
-                return
-            provisioning_blocks.provisioning_complete(
-                context._plugin_context, port['id'], resources.PORT,
-                GENERIC_SWITCH_ENTITY)
+            if local_group_information:
+                self._lag_alter_local_link(local_group_information,
+                                           local_link_information)
+            for switch in local_link_information:
+                switch_info = switch.get('switch_info')
+                switch_id = switch.get('switch_id')
+                switch_device = device_utils.get_switch_device(
+                    self.switches, switch_info=switch_info,
+                    ngs_mac_address=switch_id)
+                if not switch_device:
+                    return
+                provisioning_blocks.provisioning_complete(
+                    context._plugin_context, port['id'], resources.PORT,
+                    GENERIC_SWITCH_ENTITY)
         elif self._is_port_bound(context.original):
             # The port has been unbound. This will cause the local link
             # information to be lost, so remove the port from the network on
@@ -439,43 +590,150 @@ class GenericSwitchDriver(api.MechanismDriver):
         port = context.current
         binding_profile = port['binding:profile']
         local_link_information = binding_profile.get('local_link_information')
+        local_group_information = binding_profile.get('local_group_information')
         if self._is_port_supported(port) and local_link_information:
-            switch_info = local_link_information[0].get('switch_info')
-            switch_id = local_link_information[0].get('switch_id')
-            switch = device_utils.get_switch_device(
-                self.switches, switch_info=switch_info,
-                ngs_mac_address=switch_id)
-            if not switch:
-                return
-            network = context.network.current
-            physnet = network['provider:physical_network']
-            switch_physnets = switch._get_physical_networks()
-            if switch_physnets and physnet not in switch_physnets:
-                LOG.error("Cannot bind port %(port)s as device %(device)s is "
-                          "not on physical network %(physnet)",
-                          {'port_id': port['id'], 'device': switch_info,
-                           'physnet': physnet})
-                return
-            port_id = local_link_information[0].get('port_id')
-            segments = context.segments_to_bind
-            # If segmentation ID is None, set vlan 1
-            segmentation_id = segments[0].get('segmentation_id') or '1'
-            provisioning_blocks.add_provisioning_component(
-                context._plugin_context, port['id'], resources.PORT,
-                GENERIC_SWITCH_ENTITY)
-            LOG.debug("Putting port {port} on {switch_info} to vlan: "
-                      "{segmentation_id}".format(
-                          port=port_id,
-                          switch_info=switch_info,
-                          segmentation_id=segmentation_id))
+            if local_group_information:
+                self._setup_lag(local_group_information,
+                                local_link_information)
+            else:
+                # TODO(janvondra): Consider check whether there is only one switch in local_link_info in case of no local_group_information
+                pass
+            #TODO(janvondra): Some switches are able to copy configuration thus no need to perform following for cycle
+            for switch in local_link_information:
+                self._bind_port_to_switch(context, port, switch)
+
+    def _bind_port_to_switch(self, context, port, switch):
+        switch_info = switch.get('switch_info')
+        switch_id = switch.get('switch_id')
+        switch_device = device_utils.get_switch_device(
+            self.switches, switch_info=switch_info,
+            ngs_mac_address=switch_id)
+        if not switch:
+            return
+        network = context.network.current
+
+        net_type = network['provider:network_type']
+        if net_type != 'vlan':
+            raise exceptions.BadNetTypeError(actual=net_type)
+
+        physnet = network['provider:physical_network']
+        switch_physnets = switch_device._get_physical_networks()
+        if switch_physnets and physnet not in switch_physnets:
+            LOG.error(
+                "Cannot bind port %(port)s as device %(device)s is "
+                "not on physical network %(physnet)",
+                {'port_id': port['id'], 'device': switch_info,
+                 'physnet': physnet})
+            return
+        port_id = switch.get('port_id')
+        segments = context.segments_to_bind
+        # If segmentation ID is None, set vlan 1
+        segmentation_id = segments[0].get('segmentation_id') or '1'
+        provisioning_blocks.add_provisioning_component(
+            context._plugin_context, port['id'], resources.PORT,
+            GENERIC_SWITCH_ENTITY)
+        LOG.debug("Putting port {port} on {switch_info} to vlan: "
+                  "{segmentation_id}".format(
+                    port=port_id,
+                    switch_info=switch_info,
+                    segmentation_id=segmentation_id))
+
+        if self._is_trunk(port) and switch_device.get_trunk_mode() == 'dynamic':
+            trunk_details = port['trunk_details']
+            self._setup_trunk(switch_device, network, trunk_details, port_id)
+        else:
             # Move port to network
-            switch.plug_port_to_network(port_id, segmentation_id)
+            switch_device.plug_port_to_network(port_id, segmentation_id)
             LOG.info("Successfully bound port %(port_id)s in segment "
                      "%(segment_id)s on device %(device)s",
-                     {'port_id': port['id'], 'device': switch_info,
+                     {'port_id': port['id'],
+                      'device': switch_info,
                       'segment_id': segmentation_id})
-            context.set_binding(segments[0][api.ID],
-                                portbindings.VIF_TYPE_OTHER, {})
+
+        context.set_binding(segments[0][api.ID],
+                            portbindings.VIF_TYPE_OTHER, {})
+
+    def _check_subport_seg_ids(self, subports):
+        for subport in subports:
+            if subport.get('provider:segmentation_id') != subport.get('segmentation_id'):
+                raise exceptions.BadSegIdBindError(
+                    actual=subport.get('segmentation_id'),
+                    parent=subport.get('provider:segmentation_id')
+                )
+
+    def _setup_trunk(self, switch, network, trunk_details, port_id):
+        self._check_subport_seg_ids(trunk_details.get("sub_ports"))
+
+        native_vlan = network['provider:segmentation_id']
+        parent_physnet = network['provider:physical_network']
+
+        physnets = [sub_port['provider:physical_network'] for sub_port in trunk_details["sub_ports"]]
+        self._check_physnets(parent_physnet, physnets)
+
+        seg_ids = [sub_port['segmentation_id'] for sub_port in trunk_details["sub_ports"]]
+        switch.setup_trunk(native_vlan, seg_ids, port_id)
+
+    @staticmethod
+    def _is_trunk(port):
+        return 'trunk_details' in port
+
+    def _setup_lag(self, local_group, local_link):
+        """Setup line aggregation on switch and alter local_link
+        according to aggregation setup
+
+        Given the information in local_link and local_group either
+        multi-chassis or single-chassis line aggregation is configured
+
+        :param local_group: local group dictionary
+        :param local_link: local link dictionary
+        :return interface designation (string)
+        """
+        self._lag_alter_local_link(local_group, local_link)
+        if len(local_link) > 1:
+            self._setup_mc_lag(local_group, local_link)
+        else:
+            self._setup_sc_lag(local_group, local_link)
+
+    def _lag_alter_local_link(self, local_group, local_link):
+        agg_interface = self._get_lag_interface(local_group)
+        if agg_interface:
+            for switch in local_link:
+                switch['port_id'] = agg_interface
+        else:
+            #TODO(janvondra): raise sane error
+            pass
+
+    def _setup_mc_lag(self, local_group, local_link):
+        """Setup multi-chassis link aggregation
+
+        :param local_group: local group dictionary
+        :param local_link: local link dictionary
+        """
+        pass
+
+    def _setup_sc_lag(self, local_group, local_link):
+        pass
+
+    @staticmethod
+    def _get_lag_interface(local_group):
+        """Return interface designation according to the
+        port group property interface_name
+
+        :param local_group: local_group dictionary
+        :return: interface designation (string)
+        """
+        bond_properties = local_group.get("bond_properties")
+        return bond_properties.get("bond_interface_name")
+
+    def _get_lag_id(self, local_group):
+        pass
+
+    def _get_used_lag_interfaces(self, local_link):
+        lag_interfaces = []
+        for router in local_link:
+            # get configured lag interfaces and add them to interfaces
+            pass
+        return lag_interfaces
 
     @staticmethod
     def _is_port_supported(port):
@@ -516,32 +774,41 @@ class GenericSwitchDriver(api.MechanismDriver):
         """
         binding_profile = port['binding:profile']
         local_link_information = binding_profile.get('local_link_information')
+        local_group_information = binding_profile.get(
+            'local_group_information')
         if not local_link_information:
             return
-        switch_info = local_link_information[0].get('switch_info')
-        switch_id = local_link_information[0].get('switch_id')
-        switch = device_utils.get_switch_device(
-            self.switches, switch_info=switch_info,
-            ngs_mac_address=switch_id)
-        if not switch:
-            return
-        port_id = local_link_information[0].get('port_id')
-        # If segmentation ID is None, set vlan 1
-        segmentation_id = network.get('provider:segmentation_id') or '1'
-        LOG.debug("Unplugging port {port} on {switch_info} from vlan: "
-                  "{segmentation_id}".format(
-                      port=port_id,
-                      switch_info=switch_info,
-                      segmentation_id=segmentation_id))
-        try:
-            switch.delete_port(port_id, segmentation_id)
-        except Exception as e:
-            LOG.error("Failed to unplug port %(port_id)s "
-                      "on device: %(switch)s from network %(net_id)s "
-                      "reason: %(exc)s",
-                      {'port_id': port['id'], 'net_id': network['id'],
-                       'switch': switch_info, 'exc': e})
-            raise e
+        if local_group_information:
+            self._lag_alter_local_link(local_group_information,
+                                       local_link_information)
+        for switch in local_link_information:
+            switch_info = switch.get('switch_info')
+            switch_id = switch.get('switch_id')
+            switch_device = device_utils.get_switch_device(
+                self.switches, switch_info=switch_info,
+                ngs_mac_address=switch_id)
+            if not switch_device:
+                return
+            port_id = local_link_information[0].get('port_id')
+            # If segmentation ID is None, set vlan 1
+            segmentation_id = network.get('provider:segmentation_id') or '1'
+            LOG.debug("Unplugging port {port} on {switch_info} from vlan: "
+                      "{segmentation_id}".format(
+                          port=port_id,
+                          switch_info=switch_info,
+                          segmentation_id=segmentation_id))
+            try:
+                if self._is_trunk(port) and switch_device.get_trunk_mode() == "dynamic":
+                    switch_device.unset_trunk(port_id, segmentation_id)
+                else:
+                    switch_device.delete_port(port_id, segmentation_id)
+            except Exception as e:
+                LOG.error("Failed to unplug port %(port_id)s "
+                          "on device: %(switch)s from network %(net_id)s "
+                          "reason: %(exc)s",
+                          {'port_id': port['id'], 'net_id': network['id'],
+                           'switch': switch_info, 'exc': e})
+                raise e
         LOG.info('Port %(port_id)s has been unplugged from network '
                  '%(net_id)s on device %(device)s',
                  {'port_id': port['id'], 'net_id': network['id'],

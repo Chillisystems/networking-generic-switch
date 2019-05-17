@@ -31,7 +31,6 @@ JUNIPER_INTERNAL_OPTS = [
 
 
 class Juniper(netmiko_devices.NetmikoSwitch):
-
     ADD_NETWORK = (
         'set vlans {network_id} vlan-id {segmentation_id}',
     )
@@ -72,6 +71,21 @@ class Juniper(netmiko_devices.NetmikoSwitch):
         'vlan members {segmentation_id}',
     )
 
+    # delets all member vlans and resets them to those stored in database
+    # trunks
+    RESET_TRUNK = (
+        'delete interfaces {port_id} unit 0 family ethernet-switching vlan members',
+        'set interfaces {port_id} unit 0 family ethernet-switching interface-mode trunk',
+        'set interfaces {port_id} unit 0 family ethernet-switching vlan {members}',
+        'set interfaces {port_id} native-vlan-id {native_vlan_id}',
+    )
+
+    UNSET_TRUNK = (
+        'delete interfaces {port_id} unit 0 family ethernet-switching vlan members',
+        'delete interfaces {port_id} native-vlan-id',
+        'set interfaces {port_id} unit 0 family ethernet-switching interface-mode access',
+    )
+
     def __init__(self, device_cfg):
         super(Juniper, self).__init__(device_cfg)
 
@@ -82,6 +96,50 @@ class Juniper(netmiko_devices.NetmikoSwitch):
                 self.ngs_config[opt_name] = self.config.pop(opt_name)
             elif 'default' in opt:
                 self.ngs_config[opt_name] = opt['default']
+
+    def _prepend_member(self, id):
+        return "members {}".format(str(id))
+
+    def _build_members(self, subports):
+        return [
+            self._prepend_member(subport_id) for subport_id in subports
+        ]
+
+    def unset_trunk(self, port_id, segment_id):
+        cmds = self._format_commands(
+            self.UNSET_TRUNK,
+            port_id=port_id,
+            segment_id=segment_id
+        )
+        return self.send_commands_to_device(cmds)
+
+    def setup_trunk(self, native_vlan_id, subports, port_id):
+        new_vlans = set(subports)
+        new_vlans.add(native_vlan_id)
+        return self._reset_trunk(native_vlan_id, new_vlans, port_id)
+
+    def add_trunk_vlans(self, subports, port_id, trunk_ports, native_vlan):
+        new_vlans = set(trunk_ports) | set(subports)
+        new_vlans.add(native_vlan)
+        return self._reset_trunk(native_vlan, new_vlans, port_id)
+
+    def remove_trunk_vlans(self, subports, port_id, trunk_ports, native_vlan):
+        new_vlans = set(trunk_ports) - set(subports)
+        new_vlans.add(native_vlan)
+        return self._reset_trunk(native_vlan, new_vlans, port_id)
+
+    def _reset_trunk(self, native_vlan_id, vlans, port_id):
+        prepended_members = self._build_members(vlans)
+        joined_members = " ".join(prepended_members)
+
+        cmds = self._format_commands(
+            self.RESET_TRUNK,
+            port_id=port_id,
+            members=joined_members,
+            native_vlan_id=native_vlan_id
+        )
+
+        return self.send_commands_to_device(cmds)
 
     def send_config_set(self, net_connect, cmd_set):
         """Send a set of configuration lines to the device.

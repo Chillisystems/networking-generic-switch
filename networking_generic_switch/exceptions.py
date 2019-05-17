@@ -13,6 +13,7 @@
 #    under the License.
 
 from neutron_lib import exceptions
+from neutron.plugins.ml2.common import exceptions as plugin_exceptions
 
 from networking_generic_switch._i18n import _
 
@@ -43,3 +44,23 @@ class GenericSwitchNetmikoConnectError(GenericSwitchException):
 
 class GenericSwitchNetmikoConfigError(GenericSwitchException):
     message = _("Netmiko configuration error: %(config)s, error: %(error)s")
+
+
+class BadSegIdAddError(plugin_exceptions.MechanismDriverCriticalError):
+    message = _("Attempted to add subport [%(subport_id)s] to trunk with "
+                "segmentation id not matching that of parent network: "
+                "was %(actual)s, expected %(parent)s")
+
+
+class BadSegIdBindError(plugin_exceptions.MechanismDriverCriticalError):
+    message = _("Attempted to bind trunk with segmentation id not matching "
+                "that of parent network: was %(actual)s, expected %(parent)s")
+
+
+class BadPhysnetsAddError(plugin_exceptions.MechanismDriverCriticalError):
+    message = _("Attempted to add subport [%(subport_id)s] to trunk with "
+                "physnet not matching that of parent network: "
+                "was %(physnet)s, expected %(parent_physnet)s")
+
+class BadNetTypeError(plugin_exceptions.MechanismDriverCriticalError):
+    message = _("Only networks of type 'vlan' are allowed; was %(actual)s")
